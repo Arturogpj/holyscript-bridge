@@ -119,6 +119,7 @@ def _ensure_mcp():
             )
             _register_resolution_tool(server, session)
             _register_upload_route(server, session)
+            _register_preview_route(server, session)
             import uvicorn
 
             _log(f"MCP server starting on {API_HOST}:{API_PORT}")
@@ -499,6 +500,86 @@ def _register_upload_route(server, session):
 
     server.custom_route("/holy/upload", methods=["PUT", "OPTIONS"], include_in_schema=False)(holy_upload)
     _log("upload route registered")
+
+
+# Live preview. WanGP builds a preview picture during every render, headless
+# included (api_cli "preview" command -> PreviewUpdate with a PIL image), but
+# its MCP layer only forwards `has_image_preview: true`. We keep the newest
+# picture per job and serve it at GET /holy/preview?job=<mcp job id>.
+_preview_lock = threading.Lock()
+_jobs_by_id = {}      # mcp job_id -> SessionJob (newest last, bounded)
+_previews = {}        # id(SessionJob) -> {"image", "seq", "jpeg", "jpeg_seq"}
+_MAX_PREVIEW_JOBS = 12
+
+
+def _register_preview_route(server, session):
+    try:
+        from shared import mcp_server as _mcp
+    except Exception as exc:
+        _log(f"preview route unavailable: {exc}")
+        return
+
+    # 1) Remember which SessionJob each MCP job id belongs to.
+    store_cls = getattr(_mcp, "_JobStore", None)
+    if store_cls is not None and not getattr(store_cls, "_holy_preview_patched", False):
+        original_submit = store_cls.submit
+
+        def submit(self, source):
+            record = original_submit(self, source)
+            with _preview_lock:
+                _jobs_by_id[record.job_id] = record.job
+                while len(_jobs_by_id) > _MAX_PREVIEW_JOBS:
+                    old_id = next(iter(_jobs_by_id))
+                    old_job = _jobs_by_id.pop(old_id)
+                    _previews.pop(id(old_job), None)
+            return record
+
+        store_cls.submit = submit
+        store_cls._holy_preview_patched = True
+
+    # 2) Keep the newest preview picture each job emits. Cheap on the
+    #    render thread: store the reference, encode only when asked.
+    original_emit = session._emit_callback
+
+    def emit(method_name, payload, *, job=None):
+        if method_name == "on_preview" and job is not None:
+            image = getattr(payload, "image", None)
+            if image is not None:
+                with _preview_lock:
+                    slot = _previews.setdefault(id(job), {"seq": 0, "jpeg": None, "jpeg_seq": -1})
+                    slot["image"] = image
+                    slot["seq"] += 1
+        return original_emit(method_name, payload, job=job)
+
+    session._emit_callback = emit
+
+    def holy_preview(request):
+        import io
+
+        from starlette.responses import JSONResponse, Response
+
+        job_id = (request.query_params.get("job") or "").strip()
+        with _preview_lock:
+            job = _jobs_by_id.get(job_id)
+            slot = _previews.get(id(job)) if job is not None else None
+            if not slot or slot.get("image") is None:
+                return JSONResponse({"error": "no preview yet"}, status_code=404)
+            if slot["jpeg_seq"] != slot["seq"]:
+                try:
+                    image = slot["image"].convert("RGB")
+                    if image.width > 1280:
+                        image = image.resize((1280, max(1, round(image.height * 1280 / image.width))))
+                    buf = io.BytesIO()
+                    image.save(buf, format="JPEG", quality=82)
+                    slot["jpeg"] = buf.getvalue()
+                    slot["jpeg_seq"] = slot["seq"]
+                except Exception as exc:
+                    return JSONResponse({"error": f"preview encode failed: {exc}"}, status_code=500)
+            body = slot["jpeg"]
+        return Response(body, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=30"})
+
+    server.custom_route("/holy/preview", methods=["GET"], include_in_schema=False)(holy_preview)
+    _log("preview route registered")
 
 
 def _status_lines():
