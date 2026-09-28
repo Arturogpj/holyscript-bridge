@@ -279,6 +279,34 @@ def _register_resolution_tool(server, session):
     server.custom_route("/holy/file", methods=["GET"], include_in_schema=False)(holy_file)
     _log("file route registered")
 
+    # What a finished clip was made with. WanGP writes the settings it
+    # ACTUALLY used (random seed resolved) into the file's metadata, so the
+    # site can show the seed of clips that went out as "random".
+    # Read by fetch() → CORS for allowed origins only.
+    def holy_meta(request):
+        from starlette.responses import JSONResponse
+
+        origin = request.headers.get("origin", "")
+        headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if _origin_allowed(origin) else {}
+        name = (request.query_params.get("name") or "")
+        safe = os.path.basename(name)
+        if not safe or safe != name or ".." in name:
+            return JSONResponse({"error": "bad filename"}, status_code=400, headers=headers)
+        path = os.path.join(_app_dir, "outputs", safe)
+        if not os.path.isfile(path):
+            return JSONResponse({"error": "not found in outputs"}, status_code=404, headers=headers)
+        try:
+            from shared.utils.video_metadata import read_metadata_from_video
+
+            meta = read_metadata_from_video(path) or {}
+        except Exception as exc:
+            return JSONResponse({"error": f"metadata unreadable: {exc}"}, status_code=500, headers=headers)
+        keep = ("seed", "model_type", "resolution", "video_length", "num_inference_steps", "guidance_phases", "generation_time")
+        return JSONResponse({k: meta.get(k) for k in keep if k in meta}, headers=headers)
+
+    server.custom_route("/holy/meta", methods=["GET"], include_in_schema=False)(holy_meta)
+    _log("meta route registered")
+
 
 _upload_log = os.path.join(_here, "holy-uploads.log")
 
