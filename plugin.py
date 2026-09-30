@@ -14,13 +14,20 @@ The Holy Script website talks to WanGP through that address (the
 site resolves the MCP path itself - users paste the plain address).
 """
 
+import hashlib
+import inspect
+import json
 import os
+import platform
 import re
 import shutil
 import socket
 import subprocess
+import sys
+import tarfile
 import threading
 import time
+import urllib.request
 
 import gradio as gr
 
@@ -34,9 +41,21 @@ API_PORT = 7866
 
 _TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
+# The site talks to WanGP's MCP API v2. WanGP added these arguments to
+# build_server_for_session on 2026-09-07 (v12.73); an older WanGP fails
+# with a bare "unexpected keyword argument", so we check up front.
+MIN_WANGP = "v12.73"
+_V2_ARGS = ("api_version", "allow_async")
+
+# cloudflared is fetched from Cloudflare's own GitHub releases the first
+# time it's missing - the writer's friends never install anything by hand.
+_RELEASE_API = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+_RELEASE_DIRECT = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
+
 _state = {
-    "mcp": "starting",     # starting | ok | local-only | error: ...
-    "tunnel": "starting",  # starting | ok | error: ... | no-cloudflared
+    "mcp": "starting",     # starting | ok | local-only | outdated | error: ...
+    "tunnel": "starting",  # starting | installing | install-failed | ok | error: ...
+    "tunnel_why": "",      # reason when tunnel == install-failed
     "url": "",
 }
 _url_event = threading.Event()
@@ -59,6 +78,24 @@ def _port_open(host, port):
         return True
     except OSError:
         return False
+
+
+def _wangp_version():
+    """This box's WanGP version as 'v12.73' (None when it can't be read)."""
+    for name in ("wgp", "__main__"):
+        version = getattr(sys.modules.get(name), "WanGP_version", None)
+        if version:
+            return f"v{version}"
+    return None
+
+
+def _api_v2_ready(build_server):
+    """True when this WanGP's MCP server builder speaks API v2."""
+    try:
+        params = inspect.signature(build_server).parameters
+    except (TypeError, ValueError):
+        return True  # can't tell - try anyway, the real error will show
+    return all(name in params for name in _V2_ARGS)
 
 
 def _ensure_mcp():
@@ -85,10 +122,21 @@ def _ensure_mcp():
             from shared.api import init as _api_init
             from shared.mcp_server import build_server_for_session
 
-            # Tunnel URL arrives seconds after boot; the API is useless
-            # from outside before it exists anyway. Fall back to
-            # localhost-only if the tunnel never materializes.
-            _url_event.wait(timeout=90)
+            if not _api_v2_ready(build_server_for_session):
+                _state["mcp"] = "outdated"
+                _log(f"this WanGP ({_wangp_version() or 'unknown version'}) is too "
+                     f"old for Holy Script - update WanGP (needs {MIN_WANGP} or newer)")
+                return
+
+            # Tunnel URL arrives seconds after boot (longer the very first
+            # time, while cloudflared downloads); the API is useless from
+            # outside before it exists anyway. Fall back to localhost-only
+            # if the tunnel never materializes.
+            waited = 0
+            while not _url_event.wait(timeout=2):
+                waited += 2
+                if waited >= (240 if _state["tunnel"] == "installing" else 90):
+                    break
             allowed = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
             host = urlsplit(_state["url"]).netloc.split(":")[0] if _state["url"] else ""
             if host:
@@ -138,29 +186,178 @@ def _ensure_mcp():
     threading.Thread(target=_run, name="holy-mcp", daemon=True).start()
 
 
+_CLOUDFLARED = "cloudflared.exe" if os.name == "nt" else "cloudflared"
+
+
+def _cloudflared_candidates(app_dir):
+    """Where cloudflared may live, most specific first.
+
+    Pinokio puts WanGP at <pinokio>/api/<name>.git/app and its tools in
+    <pinokio>/bin - on ANY drive or folder - so walking up from the app
+    folder finds the right one wherever Pinokio was installed. The app
+    folder itself is where the auto-installer puts its own copy.
+    """
+    yield os.path.join(app_dir, _CLOUDFLARED)
+    folder = os.path.abspath(app_dir)
+    while True:
+        yield os.path.join(folder, "bin", _CLOUDFLARED)
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    for root in (r"D:\pinokio", r"C:\pinokio",
+                 os.path.join(os.path.expanduser("~"), "pinokio")):
+        yield os.path.join(root, "bin", _CLOUDFLARED)
+
+
 def _find_cloudflared():
-    for candidate in (
-        r"D:\pinokio\bin\cloudflared.exe",
-        r"C:\pinokio\bin\cloudflared.exe",
-        os.path.join(_app_dir, "cloudflared.exe"),
-    ):
+    for candidate in _cloudflared_candidates(_app_dir):
         if os.path.isfile(candidate):
             return candidate
     return shutil.which("cloudflared")
 
 
+def _cloudflared_asset():
+    """Name of Cloudflare's release file for this system (None = no build)."""
+    machine = platform.machine().lower()
+    if machine in ("amd64", "x86_64"):
+        arch = "amd64"
+    elif machine in ("arm64", "aarch64"):
+        arch = "arm64"
+    else:
+        return None
+    if os.name == "nt":
+        return "cloudflared-windows-amd64.exe" if arch == "amd64" else None
+    if sys.platform == "darwin":
+        return f"cloudflared-darwin-{arch}.tgz"
+    return f"cloudflared-linux-{arch}"
+
+
+def _release_asset(asset):
+    """(download url, sha256 or None) for the newest cloudflared release.
+
+    GitHub lists a sha256 digest for every release file; when the lookup
+    fails we still download over HTTPS from the same repo, just unchecked.
+    """
+    try:
+        req = urllib.request.Request(_RELEASE_API, headers={
+            "User-Agent": "holy-script-plugin",
+            "Accept": "application/vnd.github+json",
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            release = json.load(resp)
+        for item in release.get("assets", []):
+            if item.get("name") == asset:
+                digest = str(item.get("digest") or "")
+                return (item["browser_download_url"],
+                        digest[7:].lower() if digest.startswith("sha256:") else None)
+    except Exception as exc:
+        _log(f"release lookup failed ({exc}) - using the direct download link")
+    return _RELEASE_DIRECT + asset, None
+
+
+def _download(url, dest):
+    """Stream url to dest; returns the sha256 of what was written."""
+    req = urllib.request.Request(url, headers={"User-Agent": "holy-script-plugin"})
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+        while True:
+            chunk = resp.read(1 << 16)
+            if not chunk:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    return digest.hexdigest()
+
+
+def _extract_tgz(archive, final):
+    """macOS builds ship as .tgz: pull out the one file we need."""
+    with tarfile.open(archive) as tar:
+        member = next((m for m in tar.getmembers()
+                       if m.isfile() and os.path.basename(m.name) == "cloudflared"), None)
+        if member is None:
+            raise RuntimeError("cloudflared was not inside the download")
+        with open(final + ".new", "wb") as out:
+            shutil.copyfileobj(tar.extractfile(member), out)
+    os.replace(final + ".new", final)
+
+
+def _binary_runs(path):
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True,
+                             timeout=30, stdin=subprocess.DEVNULL)
+        return out.returncode == 0 and "cloudflared" in (out.stdout + out.stderr).lower()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _install_cloudflared(dest_dir=None):
+    """Download Cloudflare's official cloudflared into the WanGP app folder.
+
+    Returns (path, "") or (None, reason). Runs only when nothing was
+    found, so a friend never has to install or type anything. Never
+    leaves a half-written file where _find_cloudflared would trust it.
+    """
+    asset = _cloudflared_asset()
+    if not asset:
+        return None, f"no cloudflared build for this system ({sys.platform}/{platform.machine()})"
+    dest_dir = dest_dir or _app_dir
+    final = os.path.join(dest_dir, _CLOUDFLARED)
+    part = final + ".part"
+    try:
+        url, expected = _release_asset(asset)
+        _log(f"downloading {url}")
+        digest = _download(url, part)
+        if expected and digest != expected:
+            raise RuntimeError("the download did not match Cloudflare's checksum")
+        if asset.endswith(".tgz"):
+            _extract_tgz(part, final)
+            os.remove(part)
+        else:
+            os.replace(part, final)
+        if os.name != "nt":
+            os.chmod(final, 0o755)
+        if not _binary_runs(final):
+            os.remove(final)
+            raise RuntimeError("the downloaded file would not start")
+        _log(f"cloudflared installed: {final}")
+        return final, ""
+    except Exception as exc:
+        for leftover in (part, final + ".new"):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+        return None, str(exc) or exc.__class__.__name__
+
+
 def _ensure_tunnel():
-    """Spawn cloudflared as OUR child + watch its log for the URL."""
+    """Bring the tunnel up in the background (never blocks WanGP's UI build)."""
     global _tunnel_started
     if _tunnel_started:
         return
     _tunnel_started = True
+    threading.Thread(target=_tunnel_main, name="holy-tunnel", daemon=True).start()
 
+
+def _tunnel_main():
     exe = _find_cloudflared()
     if not exe:
-        _state["tunnel"] = "no-cloudflared"
-        _log("cloudflared not found - tunnel disabled (API still works locally)")
-        return
+        _state["tunnel"] = "installing"
+        _log("cloudflared not found - downloading it from Cloudflare (first time only)")
+        exe, why = _install_cloudflared()
+        if not exe:
+            _state["tunnel"] = "install-failed"
+            _state["tunnel_why"] = why
+            _log(f"could not install cloudflared: {why}")
+            _url_event.set()  # no tunnel is coming: let the API start now, localhost-only
+            return
+        _state["tunnel"] = "starting"
+    _start_tunnel(exe)
+
+
+def _start_tunnel(exe):
+    """Spawn cloudflared as OUR child + watch its log for the URL."""
 
     def _watch(log_path):
         url = ""
@@ -207,6 +404,7 @@ def _ensure_tunnel():
     except Exception as exc:
         _state["tunnel"] = f"error: {exc}"
         _log(f"tunnel failed to start: {exc}")
+        _url_event.set()  # no tunnel is coming: let the API start now, localhost-only
 
 
 def _register_resolution_tool(server, session):
@@ -611,7 +809,13 @@ def _register_preview_route(server, session):
 
 
 def _status_lines():
-    if _port_open(API_HOST, API_PORT):
+    if _state["mcp"] == "outdated":
+        ver = _wangp_version()
+        api = (f"OUTDATED - this WanGP is too old for Holy Script "
+               f"({'yours is ' + ver + ', ' if ver else ''}needs {MIN_WANGP} or newer).\n"
+               "    Update WanGP (Pinokio: open WanGP, click Update), restart it, "
+               "then press Refresh status.")
+    elif _port_open(API_HOST, API_PORT):
         api = f"OK - listening on {API_HOST}:{API_PORT}"
     elif _state["mcp"] == "local-only":
         api = "LOCAL ONLY - tunnel never came up, remote stays red"
@@ -624,8 +828,11 @@ def _status_lines():
         tun = "RUNNING"
     elif t == "starting":
         tun = "starting..."
-    elif t == "no-cloudflared":
-        tun = "DISABLED - cloudflared not found (local API still works)"
+    elif t == "installing":
+        tun = "installing - downloading cloudflared from Cloudflare (one time only)..."
+    elif t == "install-failed":
+        tun = (f"FAILED - couldn't download cloudflared ({_state['tunnel_why']}).\n"
+               "    Check your internet connection and restart WanGP to try again.")
     else:
         tun = "FAILED - " + t
     return f"API server: {api}\nTunnel: {tun}", _state["url"]
@@ -659,7 +866,7 @@ class HolyScriptPlugin(WAN2GPPlugin):
                 "shut down together with it."
             )
             status = gr.Text(label="Status", value=status_text,
-                             lines=2, interactive=False)
+                             lines=5, interactive=False)
             url_box = gr.Text(label="Public API address",
                               value=url, interactive=False,
                               show_copy_button=True)

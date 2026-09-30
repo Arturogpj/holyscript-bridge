@@ -9,8 +9,9 @@ GitHub repo and WanGP's Plugin Manager clones it straight into
 copy in the main app repo at `wangp-plugin/holy-script/` — keep the two
 in sync when the plugin changes.
 
-A private repo works for sharing with a specific person: WanGP clones
-with the user's GitHub auth, so just add them as a collaborator.
+This repo is public, so anyone can install it from the URL. (A private
+repo would only work for people added as collaborators — WanGP clones
+with the user's GitHub auth — and everyone else would see "not found".)
 
 ## What it does
 
@@ -59,9 +60,18 @@ Only for installs where the Plugin Manager isn't available:
 2. Enable it once: in `app/wgp_config.json` add `"holy-script"` to the
    `enabled_plugins` list (or enable it in WanGP's plugin manager).
 
-`cloudflared` is found automatically (Pinokio bundles it; otherwise any
-copy on `PATH`). If it isn't found, the tab says so and the local API
-still works.
+`cloudflared` is found automatically: in the `bin` folder of whichever
+Pinokio install WanGP lives in (any drive or folder), in the WanGP `app`
+folder, or on `PATH`. If it is missing, **the plugin downloads it
+itself** the first time (from Cloudflare's official GitHub releases,
+checked against the SHA-256 GitHub lists for the file, saved into the
+WanGP `app` folder) - nobody has to install or type anything. The tab
+says `installing...` meanwhile; with no internet it says so, and a
+restart of WanGP tries again.
+
+**Needs WanGP v12.73 or newer** (the September 2026 MCP v2 update).
+On an older WanGP the tab says `OUTDATED` and how to update, instead
+of failing with a Python error.
 
 ## What the plugin serves
 
@@ -70,7 +80,7 @@ you paste the plain address only), the plugin registers:
 
 | Route / tool | What it does |
 |---|---|
-| MCP `POST /mcp` | WanGP's own MCP API (JSON-RPC). FastMCP answers **421** to hosts it hasn't allowlisted — the plugin adds your tunnel host automatically once the tunnel URL is known (up to 90 s), else localhost-only. |
+| MCP `POST /mcp` | WanGP's own MCP API (JSON-RPC). FastMCP answers **421** to hosts it hasn't allowlisted — the plugin adds your tunnel host automatically once the tunnel URL is known (up to 90 s - up to 4 min the first time, while cloudflared downloads), else localhost-only. |
 | `GET /holy/file?name=…` | Serves a clip straight from WanGP's flat `outputs/` folder — permanent, seekable playback URLs for takes (basename only, 400 on traversal, 404 if gone). |
 | `PUT /holy/upload` | Direct browser upload for reference images/audio/video — avoids the website's ~4.5 MB request cap. Origin-allowlisted (`script.holyfstudios.com`, `localhost`/`127.0.0.1`, `*.vercel.app` for previews), CORS-preflightable (`OPTIONS` → 204), filename sanitized with extension derived from MIME when missing, **videos remuxed through ffmpeg to a duration-bearing `.mp4`** (WanGP's `has_video_file_extension` does not include `.webm`, and MediaRecorder files have no Duration — both caused "Reference Video must be at least 2 seconds long (found 0.00s)"), stored under `outputs/mcp_uploads/<id>/` and registered as gallery media. |
 | `GET /holy/meta?name=…` | What a finished clip was made with, read from the file's own metadata (WanGP writes the settings it actually used — the resolved random seed too): `seed`, `model_type`, `resolution`, steps, phases. CORS for the allowed origins. Lets the site show the seed of clips that went out as "random". |
@@ -86,7 +96,7 @@ In this plugin folder unless noted:
 - `holy-address.txt` (in the WanGP app folder) — the current public address
 - MCP thread errors are caught so the plugin can never take WanGP down
 
-Status lines in the Holy Script tab: API `OK - listening on …` / `LOCAL ONLY` / `FAILED`; Tunnel `RUNNING` / `starting...` / `DISABLED` / `FAILED`.
+Status lines in the Holy Script tab: API `OK - listening on …` / `LOCAL ONLY` / `OUTDATED` / `FAILED`; Tunnel `RUNNING` / `starting...` / `installing...` / `FAILED`.
 
 Connection architecture (browser → site relay → MCP, plus direct uploads) is documented in the main app repo's `AGENTS.md` → *Generations + WanGP* and `README.md` → *Generations Desk & WanGP*.
 

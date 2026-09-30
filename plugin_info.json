@@ -1,7 +1,7 @@
 {
   "name": "Holy Script",
   "author": "Holy F Studios",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Exposes this WanGP to the Holy Script screenwriting app: in-process API server on :7866 plus a public tunnel address with copy button, and live render previews.",
   "type": ["app"],
   "date": "",
