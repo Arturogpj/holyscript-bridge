@@ -89,6 +89,27 @@ def _wangp_version():
     return None
 
 
+def _mcp_internals():
+    """WanGP's MCP server module (private helpers live there).
+
+    WanGP v18 (2026-10-10) moved the MCP code into the `shared.mcp`
+    package; `shared.mcp_server` is now a thin re-export WITHOUT the
+    private names (`_MAX_UPLOAD_BYTES`, `_register_gallery_media`,
+    `_JobStore`). Importing them from the old module crashed every
+    /holy/upload request - preflight included, so the browser only saw
+    an opaque CORS failure and big references were dropped. Try the new
+    home first, the old one for older boxes.
+    """
+    try:
+        from shared.mcp import server as mod
+
+        return mod
+    except Exception:
+        from shared import mcp_server as mod
+
+        return mod
+
+
 def _api_v2_ready(build_server):
     """True when this WanGP's MCP server builder speaks API v2."""
     try:
@@ -675,8 +696,10 @@ def _register_upload_route(server, session):
 
     async def holy_upload(request):
         from starlette.responses import JSONResponse, Response
-        from shared.mcp_server import _MAX_UPLOAD_BYTES, _register_gallery_media
 
+        # The preflight never touches WanGP internals: any failure past
+        # this point must still answer WITH CORS headers, or the browser
+        # hides the reason behind "Failed to fetch".
         headers = _cors_headers(request)
         origin = request.headers.get("origin", "")
         if request.method == "OPTIONS":
@@ -685,6 +708,17 @@ def _register_upload_route(server, session):
         if not _origin_allowed(origin):
             _ulog(f"REFUSED origin={origin or '-'}")
             return JSONResponse({"error": "origin not allowed"}, status_code=403, headers=headers)
+        try:
+            _mcp = _mcp_internals()
+            max_bytes = getattr(_mcp, "_MAX_UPLOAD_BYTES", 8 * 1024**3)
+            register = _mcp._register_gallery_media
+        except Exception as exc:
+            _ulog(f"FAILED (WanGP internals moved) error={exc}")
+            return JSONResponse(
+                {"error": f"this WanGP's upload helpers were not found ({exc}) - update the Holy Script plugin"},
+                status_code=500,
+                headers=headers,
+            )
 
         name = _safe_upload_name(
             request.query_params.get("name"),
@@ -702,13 +736,13 @@ def _register_upload_route(server, session):
             with open(target, "xb") as writer:
                 async for chunk in request.stream():
                     size += len(chunk)
-                    if size > _MAX_UPLOAD_BYTES:
-                        raise ValueError("upload too large")
+                    if size > max_bytes:
+                        raise ValueError(f"upload too large (over {max_bytes} bytes)")
                     writer.write(chunk)
             target = _remux_uploaded_video(target)
             name = os.path.basename(target)
             size = os.path.getsize(target)
-            record = _register_gallery_media(session, target)
+            record = register(session, target)
         except Exception as exc:
             try:
                 os.remove(target)
@@ -740,7 +774,7 @@ _MAX_PREVIEW_JOBS = 12
 
 def _register_preview_route(server, session):
     try:
-        from shared import mcp_server as _mcp
+        _mcp = _mcp_internals()
     except Exception as exc:
         _log(f"preview route unavailable: {exc}")
         return
