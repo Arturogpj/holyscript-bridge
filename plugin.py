@@ -479,10 +479,15 @@ def _register_resolution_tool(server, session):
     def holy_file(request):
         from starlette.responses import FileResponse, JSONResponse
 
+        # Playing a clip needs no CORS, but Generations -> "Add to canvas"
+        # READS the bytes with fetch(), so allowed origins get the header
+        # (same allowlist as uploads).
+        origin = request.headers.get("origin", "")
+        headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if _origin_allowed(origin) else {}
         name = (request.query_params.get("name") or "")
         safe = os.path.basename(name)
         if not safe or safe != name or ".." in name:
-            return JSONResponse({"error": "bad filename"}, status_code=400)
+            return JSONResponse({"error": "bad filename"}, status_code=400, headers=headers)
         for base in (os.path.join(_app_dir, "outputs"),):
             path = os.path.join(base, safe)
             if os.path.isfile(path):
@@ -492,8 +497,9 @@ def _register_resolution_tool(server, session):
                     path,
                     filename=safe,
                     media_type=mimetypes.guess_type(path)[0] or "video/mp4",
+                    headers=headers,
                 )
-        return JSONResponse({"error": "not found in outputs"}, status_code=404)
+        return JSONResponse({"error": "not found in outputs"}, status_code=404, headers=headers)
 
     server.custom_route("/holy/file", methods=["GET"], include_in_schema=False)(holy_file)
     _log("file route registered")
